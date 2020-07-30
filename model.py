@@ -1,16 +1,17 @@
 import tensorflow as tf
 from spektral.layers import MessagePassing
 
-from tensorflow.python.keras import Model, backend as K, Input
 from tensorflow.python.keras.layers import Dense
 
 
-class RGCNLayer(MessagePassing):
+class RGCNConv(MessagePassing):
     def __init__(self,
-                 channels,
-                 activation=None,
-                 use_bias=True,
-                 kernel_initializer=None,
+                 channels: int,
+                 features: int,
+                 num_rel_types: int=1,
+                 activation: str=None,
+                 use_bias: bool=False,
+                 kernel_initializer='normal',
                  bias_initializer=None,
                  kernel_regularizer=None,
                  bias_regularizer=None,
@@ -30,33 +31,39 @@ class RGCNLayer(MessagePassing):
                          bias_constraint=bias_constraint,
                          **kwargs)
         self.channels = self.output_dim = channels
+        self.features = features
+        self.num_rel_types = num_rel_types
+        self.activation_function = tf.nn.relu
 
     def build(self, input_shape):
         assert len(input_shape) >= 2
-        layer_kwargs = dict(
-            kernel_initializer=self.kernel_initializer,
-            kernel_regularizer=self.kernel_regularizer,
-            kernel_constraint=self.kernel_constraint
-        )
-        self.dense_1 = Dense(self.channels, activation='relu',
-                             use_bias=False, **layer_kwargs)
-        self.dense_2 = Dense(self.channels, activation='relu',
-                             use_bias=False, **layer_kwargs)
-
+        self.relation_based_layers = [
+            Dense(units=self.channels, use_bias=False, activation=None)
+            for _ in range(self.num_rel_types)
+        ]
         self.built = True
 
-    def message(self, X, E=None):
-        X_i = self.get_i(X)
-        X_j = self.get_j(X)
-        mod = 10
-        output = self.dense_1(self.dense_2(K.concatenate((X_i, X_j)))) / mod
+    def call(self, inputs, **kwargs):
+        try:
+            X, A, E = self.get_inputs(inputs)
+        except AssertionError:
+            # Assertion in get_inputs() fails because A is a list
+            X, A, E = inputs
 
-        return output
+        messages_per_type = [self.propagate(X, A[self.i], E, **kwargs)
+                             for self.i in range(self.num_rel_types)]
+        return self.activation_function(tf.concat(messages_per_type, axis=0))
+
+    def message(self, X, **kwargs):
+        X_j = self.get_j(X)
+        return self.relation_based_layers[self.i](X_j)
 
     def get_config(self):
         config = {
-            'channels': 7,
+            'channels': self.channels,
             'trainable': self.trainable,
+            'num_rel_types': self.num_rel_types,
+            'features': self.features
         }
         base_config = super().get_config()
         base_config.pop('aggregate')
@@ -64,27 +71,71 @@ class RGCNLayer(MessagePassing):
         return {**base_config, **config}
 
 
-class IRGCNModel(Model):
-    def __init__(self, depth, features, embeddings, *args, **kwargs):
+class IRGCNModel(MessagePassing):
+    def __init__(self,
+                 num_layers: int,
+                 features: int,
+                 num_rel_types: int,
+                 channels: int,
+                 embeddings: int,
+                 relation_type: str='small',
+                 *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.depth = depth
+        self.num_layers = num_layers
         self.features = features
+        self.num_rel_types = num_rel_types
+        self.channels = channels
         self.embeddings = embeddings
-        self.build_model()
+        self.relation_type = relation_type
+
+    def get_config(self):
+        config = {
+            'embeddings': self.embeddings,
+            'num_rel_types': self.num_rel_types,
+            'num_layers': self.num_layers,
+            'features': self.features,
+            'channels': self.channels,
+            'relation_type': self.relation_type
+        }
+        base_config = super().get_config()
+        return {**base_config, **config}
 
     def build(self, input_shape):
-        assert len(input_shape) >= 2
-        X_in = Input(shape=(self.features,))
-        A_in = Input(shape=(None,), sparse=True)
-        E_in = Input(shape=(self.embeddings,), dtype=tf.int64)
-        output = X_in
-        for i in range(self.depth):
-            output = RGCNLayer(10, activation='relu')([output, A_in, E_in])
 
-        output = Dense(self.features, activation='relu', use_bias=False)(output)
-        output = Dense(self.features, activation='relu', use_bias=False)(output)
+        self.rgcn_layers = [
+            RGCNConv(self.channels, self.features, activation=None,
+                     num_rel_types=self.num_rel_types)
+            for _ in range(self.num_layers)
+        ]
+        self.mlp = [
+            Dense(self.features, activation='relu', use_bias=False)
+            for _ in range(2)
+        ]
 
-        self.model = Model(inputs=[X_in, A_in, E_in], outputs=output)
+        self.built = True
 
-    def call(self, inputs, training=None, mask=None):
-        return self.model(inputs)
+    def call(self, inputs, **kwargs):
+        try:
+            X, A, E = self.get_inputs(inputs)
+        except AssertionError:
+            # Assertion in get_inputs() fails because A is a list
+            X, A, E = inputs
+        output = X
+
+        # RGCN
+        for layer in self.rgcn_layers:
+            output = layer([output, A, E])
+
+        # MLP
+        if self.relation_type == 'small':
+            relations = [self.propagate(output, A[relation], E, **kwargs)
+                         for  relation in range(self.num_rel_types)]
+            return tf.concat(relations, axis=0)
+
+        return output
+
+    def message(self, X, **kwargs):
+        X_i = self.get_i(X)
+        X_j = self.get_j(X)
+        out = self.mlp[0](tf.concat([X_i, X_j], axis=0))
+        return self.mlp[1](out)
