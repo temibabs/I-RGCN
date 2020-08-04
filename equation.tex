@@ -1,0 +1,8 @@
+\H_i = \X_i +
+               \sum\limits_{j \in \mathcal{N}(i)}
+                    \sigma \left( \z_{ij} \W^{(f)} + \b^{(f)} \right)
+                    \odot
+                    \g \left( \z_{ij} \W^{(s)} + \b^{(s)} \right)
+
+\Z_i = \X_{i} \W_{\textrm{root}} +
+\sum\limits_{j \in \mathcal{N}(i)} \X_{j} \textrm{MLP}(\E_{ji}) + \b
